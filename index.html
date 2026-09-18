@@ -1,0 +1,61 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8">
+  <title>My Agent</title>
+</head>
+
+<body>
+
+<h1>My Agent</h1>
+
+<input id="query" placeholder="Search or URL">
+<button onclick="search()">Search Internet</button>
+<button onclick="openPage()">Open Page</button>
+
+<pre id="output"></pre>
+
+<script>
+async function search() {
+  const query = document.getElementById("query").value;
+
+  const response = await fetch("/agent", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json"
+    },
+    body: JSON.stringify({
+      action: "search",
+      query
+    })
+  });
+
+  const data = await response.json();
+
+  document.getElementById("output").textContent =
+    data.result || data.error;
+}
+
+async function openPage() {
+  const query = document.getElementById("query").value;
+
+  const response = await fetch("/agent", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json"
+    },
+    body: JSON.stringify({
+      action: "open",
+      query
+    })
+  });
+
+  const data = await response.json();
+
+  document.getElementById("output").textContent =
+    data.text || data.error;
+}
+</script>
+
+</body>
+</html>
