@@ -1,981 +1,113 @@
 import express from "express";
 import http from "http";
-import crypto from "crypto";
-import { WebSocketServer } from "ws";
+import {WebSocketServer} from "ws";
+import admin from "firebase-admin";
 
-import {
-  cert,
-  getApps,
-  initializeApp
-} from "firebase-admin/app";
+const app=express();
+app.get("/",(_,res)=>res.send("MG World server online"));
+app.get("/health",(_,res)=>res.json({ok:true,players:players.size}));
 
-import {
-  getAuth
-} from "firebase-admin/auth";
+const server=http.createServer(app);
+const wss=new WebSocketServer({server});
+const players=new Map();
 
+const projectId=process.env.FIREBASE_PROJECT_ID;
+const clientEmail=process.env.FIREBASE_CLIENT_EMAIL;
+const privateKey=(process.env.FIREBASE_PRIVATE_KEY||"").replace(/\\n/g,"\n");
 
-// ======================================================
-// CONFIG
-// ======================================================
-
-const PORT =
-  Number(process.env.PORT) || 3000;
-
-
-// Firebase Admin credentials
-//
-// Railway Variables:
-//
-// FIREBASE_PROJECT_ID
-// FIREBASE_CLIENT_EMAIL
-// FIREBASE_PRIVATE_KEY
-//
-// Never put the private key in frontend code.
-//
-
-if (!process.env.FIREBASE_PROJECT_ID) {
-  console.warn(
-    "WARNING: FIREBASE_PROJECT_ID is missing"
-  );
+if(!projectId||!clientEmail||!privateKey){
+  console.warn("Firebase Admin env vars missing. Set FIREBASE_PROJECT_ID, FIREBASE_CLIENT_EMAIL, FIREBASE_PRIVATE_KEY.");
 }
+const db=projectId&&clientEmail&&privateKey
+  ? admin.initializeApp({credential:admin.credential.cert({projectId,clientEmail,privateKey}),databaseURL:"https://mgworld-dcf17-default-rtdb.asia-southeast1.firebasedatabase.app"}).database()
+  : null;
 
-if (!process.env.FIREBASE_CLIENT_EMAIL) {
-  console.warn(
-    "WARNING: FIREBASE_CLIENT_EMAIL is missing"
-  );
+const world={blocks:{}};
+async function loadWorld(){
+  if(!db)return;
+  const snap=await db.ref("world/blocks").once("value");
+  world.blocks=snap.val()||{};
 }
-
-if (!process.env.FIREBASE_PRIVATE_KEY) {
-  console.warn(
-    "WARNING: FIREBASE_PRIVATE_KEY is missing"
-  );
-}
-
-
-// ======================================================
-// FIREBASE ADMIN
-// ======================================================
-
-let firebaseAuth = null;
-
-try {
-
-  if (
-    process.env.FIREBASE_PROJECT_ID &&
-    process.env.FIREBASE_CLIENT_EMAIL &&
-    process.env.FIREBASE_PRIVATE_KEY
-  ) {
-
-    const privateKey =
-      process.env.FIREBASE_PRIVATE_KEY
-        .replace(/\\n/g, "\n");
-
-
-    const firebaseApp =
-      getApps().length
-        ? getApps()[0]
-        : initializeApp({
-            credential: cert({
-              projectId:
-                process.env.FIREBASE_PROJECT_ID,
-
-              clientEmail:
-                process.env.FIREBASE_CLIENT_EMAIL,
-
-              privateKey
-            })
-          });
-
-
-    firebaseAuth =
-      getAuth(firebaseApp);
-
-
-    console.log(
-      "Firebase Admin initialized"
-    );
-
-  } else {
-
-    console.warn(
-      "Firebase Admin is NOT configured."
-    );
-
-  }
-
-} catch (error) {
-
-  console.error(
-    "Firebase Admin initialization failed:",
-    error.message
-  );
-}
-
-
-// ======================================================
-// EXPRESS
-// ======================================================
-
-const app = express();
-
-app.disable("x-powered-by");
-
-app.get("/", (_req, res) => {
-
-  res.json({
-    name: "MG World Server",
-    status: "online",
-    players: players.size,
-    time: Date.now()
+async function savePlayer(p,online){
+  if(!db)return;
+  await db.ref(`players/${p.uid}`).update({
+    uid:p.uid,username:p.username,x:p.x,y:p.y,z:p.z,rotation:p.rotation,headRotation:p.headRotation,
+    grounded:p.grounded,moving:p.moving,online,lastSeen:admin.database.ServerValue.TIMESTAMP
   });
+}
+async function verifyUser(uid,username){
+  if(!db)return true;
+  const snap=await db.ref(`users/${uid}`).once("value");
+  const u=snap.val();
+  return !!u && u.username===username;
+}
+function send(ws,obj){if(ws.readyState===1)ws.send(JSON.stringify(obj))}
+function broadcast(obj,except=null){
+  const s=JSON.stringify(obj);
+  for(const p of players.values())if(p.ws!==except&&p.ws.readyState===1)p.ws.send(s);
+}
+function cleanPlayer(p){
+  players.delete(p.uid);
+  savePlayer(p,false).catch(console.error);
+  broadcast({type:"player_leave",uid:p.uid});
+  broadcast({type:"count",count:players.size});
+}
 
+wss.on("connection",(ws)=>{
+  let current=null;
+  ws.on("message",async raw=>{
+    let m;try{m=JSON.parse(raw.toString())}catch{return}
+    if(m.type==="auth"){
+      if(current)return;
+      if(!(await verifyUser(m.uid,m.username))){
+        return send(ws,{type:"error",message:"User verification failed"});
+      }
+      current={
+        uid:m.uid,username:m.username,ws,
+        x:Number(m.x)||10,y:Number(m.y)||0,z:Number(m.z)||0,
+        rotation:Number(m.rotation)||0,headRotation:Number(m.headRotation)||0,
+        grounded:true,moving:false
+      };
+      players.set(current.uid,current);
+      await savePlayer(current,true);
+      send(ws,{type:"init",world,players:Object.fromEntries([...players].map(([id,p])=>[id,{...p,ws:undefined}]))});
+      broadcast({type:"player_join",player:{...current,ws:undefined}},ws);
+      broadcast({type:"count",count:players.size});
+      return;
+    }
+    if(!current)return;
+    if(m.type==="move"){
+      current.x=Number(m.x)||0;current.y=Number(m.y)||0;current.z=Number(m.z)||0;
+      current.rotation=Number(m.rotation)||0;current.headRotation=Number(m.headRotation)||0;
+      current.grounded=!!m.grounded;current.moving=!!m.moving;
+      if(db)db.ref(`players/${current.uid}`).update({
+        x:current.x,y:current.y,z:current.z,rotation:current.rotation,headRotation:current.headRotation,
+        grounded:current.grounded,moving:current.moving,online:true,lastSeen:admin.database.ServerValue.TIMESTAMP
+      }).catch(console.error);
+      broadcast({type:"player_update",player:{...current,ws:undefined}},ws);
+    }
+    if(m.type==="block_set"){
+      const x=Math.floor(Number(m.x)),y=Math.floor(Number(m.y)),z=Math.floor(Number(m.z));
+      if(!Number.isFinite(x)||!Number.isFinite(y)||!Number.isFinite(z)||y<0||y>=64)return;
+      const key=`${x},${y},${z}`;
+      world.blocks[key]={color:Number(m.color)||0x9b7653,by:current.uid,updatedAt:Date.now()};
+      if(db)db.ref(`world/blocks/${key.replace(/\./g,"_")}`).set(world.blocks[key]).catch(console.error);
+      broadcast({type:"block_set",blocks:{[key]:world.blocks[key]}});
+      send(ws,{type:"world_state",blocks:{[key]:world.blocks[key]}});
+    }
+    if(m.type==="block_remove"){
+      const key=String(m.key||"");
+      if(!world.blocks[key])return;
+      delete world.blocks[key];
+      if(db)db.ref(`world/blocks/${key.replace(/\./g,"_")}`).remove().catch(console.error);
+      broadcast({type:"block_set",blocks:world.blocks});
+      send(ws,{type:"world_state",blocks:world.blocks});
+    }
+  });
+  ws.on("close",()=>{if(current&&players.get(current.uid)===current)cleanPlayer(current)});
 });
 
-
-app.get("/health", (_req, res) => {
-
-  res.json({
-    status: "ok",
-    players: players.size
-  });
-
-});
-
-
-// ======================================================
-// HTTP SERVER
-// ======================================================
-
-const httpServer =
-  http.createServer(app);
-
-
-// ======================================================
-// WEBSOCKET
-// ======================================================
-
-const wss =
-  new WebSocketServer({
-    server: httpServer,
-
-    maxPayload: 16 * 1024
-  });
-
-
-// ======================================================
-// WORLD
-// ======================================================
-
-const players =
-  new Map();
-
-
-// ======================================================
-// LIMITS
-// ======================================================
-
-const MAX_USERNAME_LENGTH = 20;
-
-const MAX_CHAT_LENGTH = 300;
-
-const MAX_COORDINATE = 100000;
-
-const MOVEMENT_INTERVAL = 50;
-
-
-// ======================================================
-// HELPERS
-// ======================================================
-
-function send(ws, data) {
-
-  if (
-    ws.readyState === ws.OPEN
-  ) {
-
-    ws.send(
-      JSON.stringify(data)
-    );
-
-  }
-
-}
-
-
-function broadcast(
-  data,
-  except = null
-) {
-
-  const message =
-    JSON.stringify(data);
-
-
-  for (
-    const player of players.values()
-  ) {
-
-    if (
-      player === except
-    ) {
-      continue;
-    }
-
-
-    if (
-      player.ws.readyState === player.ws.OPEN
-    ) {
-
-      player.ws.send(message);
-
-    }
-
-  }
-
-}
-
-
-function publicPlayer(player) {
-
-  return {
-
-    id: player.id,
-
-    uid: player.uid,
-
-    username: player.username,
-
-    x: player.x,
-
-    y: player.y,
-
-    z: player.z,
-
-    rotation: player.rotation,
-
-    online: true
-
-  };
-
-}
-
-
-// ======================================================
-// AUTHENTICATION
-// ======================================================
-
-async function verifyToken(token) {
-
-  if (!firebaseAuth) {
-
-    throw new Error(
-      "Firebase Admin is not configured"
-    );
-
-  }
-
-
-  if (
-    typeof token !== "string" ||
-    token.length < 20
-  ) {
-
-    throw new Error(
-      "Invalid Firebase token"
-    );
-
-  }
-
-
-  return await firebaseAuth.verifyIdToken(
-    token
-  );
-
-}
-
-
-// ======================================================
-// CONNECTION
-// ======================================================
-
-wss.on(
-  "connection",
-  (ws, request) => {
-
-    const player = {
-
-      id:
-        crypto.randomUUID(),
-
-      uid: null,
-
-      username: "Player",
-
-      x: 0,
-
-      y: 0,
-
-      z: 0,
-
-      rotation: 0,
-
-      ws,
-
-      authenticated: false,
-
-      joined: false,
-
-      lastMove: 0,
-
-      connectedAt: Date.now()
-
-    };
-
-
-    players.set(
-      player.id,
-      player
-    );
-
-
-    console.log(
-      "Connection:",
-      player.id
-    );
-
-
-    // --------------------------------------------------
-    // INITIAL CONNECTION
-    // --------------------------------------------------
-
-    send(ws, {
-
-      type: "connection:ready",
-
-      playerId:
-        player.id
-
-    });
-
-
-    // --------------------------------------------------
-    // MESSAGE
-    // --------------------------------------------------
-
-    ws.on(
-      "message",
-      async (raw) => {
-
-        try {
-
-          const message =
-            JSON.parse(
-              raw.toString()
-            );
-
-
-          await handleMessage(
-            player,
-            message
-          );
-
-        } catch (error) {
-
-          console.error(
-            "Message error:",
-            error.message
-          );
-
-
-          send(ws, {
-
-            type: "error",
-
-            message:
-              "Invalid request"
-
-          });
-
-        }
-
-      }
-    );
-
-
-    // --------------------------------------------------
-    // CLOSE
-    // --------------------------------------------------
-
-    ws.on(
-      "close",
-      () => {
-
-        handleDisconnect(
-          player
-        );
-
-      }
-    );
-
-
-    // --------------------------------------------------
-    // ERROR
-    // --------------------------------------------------
-
-    ws.on(
-      "error",
-      (error) => {
-
-        console.error(
-          "WebSocket error:",
-          error.message
-        );
-
-      }
-    );
-
-  }
-);
-
-
-// ======================================================
-// MESSAGE ROUTER
-// ======================================================
-
-async function handleMessage(
-  player,
-  message
-) {
-
-  if (
-    !message ||
-    typeof message.type !== "string"
-  ) {
-
-    return;
-
-  }
-
-
-  switch (message.type) {
-
-    case "auth":
-
-      await handleAuth(
-        player,
-        message
-      );
-
-      break;
-
-
-    case "player:join":
-
-      await handleJoin(
-        player,
-        message
-      );
-
-      break;
-
-
-    case "player:move":
-
-      handleMovement(
-        player,
-        message
-      );
-
-      break;
-
-
-    case "chat":
-
-      handleChat(
-        player,
-        message
-      );
-
-      break;
-
-
-    case "ping":
-
-      send(player.ws, {
-
-        type: "pong",
-
-        time: Date.now()
-
-      });
-
-      break;
-
-
-    default:
-
-      send(player.ws, {
-
-        type: "error",
-
-        message:
-          "Unknown message type"
-
-      });
-
-  }
-
-}
-
-
-// ======================================================
-// AUTH
-// ======================================================
-
-async function handleAuth(
-  player,
-  message
-) {
-
-  if (
-    player.authenticated
-  ) {
-
-    return;
-
-  }
-
-
-  const token =
-    message.token;
-
-
-  try {
-
-    const decoded =
-      await verifyToken(
-        token
-      );
-
-
-    player.uid =
-      decoded.uid;
-
-
-    player.authenticated =
-      true;
-
-
-    send(player.ws, {
-
-      type: "auth:success",
-
-      uid:
-        player.uid
-
-    });
-
-
-    console.log(
-      "Authenticated:",
-      player.uid
-    );
-
-
-  } catch (error) {
-
-    console.error(
-      "Authentication failed:",
-      error.message
-    );
-
-
-    send(player.ws, {
-
-      type: "auth:failed",
-
-      message:
-        "Firebase authentication failed"
-
-    });
-
-
-    player.ws.close(
-      1008,
-      "Authentication failed"
-    );
-
-  }
-
-}
-
-
-// ======================================================
-// JOIN WORLD
-// ======================================================
-
-async function handleJoin(
-  player,
-  message
-) {
-
-  if (
-    !player.authenticated
-  ) {
-
-    send(player.ws, {
-
-      type: "error",
-
-      message:
-        "Authenticate first"
-
-    });
-
-    return;
-
-  }
-
-
-  if (
-    player.joined
-  ) {
-
-    return;
-
-  }
-
-
-  const username =
-    String(
-      message.username || "Player"
-    )
-    .trim()
-    .slice(
-      0,
-      MAX_USERNAME_LENGTH
-    );
-
-
-  player.username =
-    username || "Player";
-
-
-  // Optional spawn position
-
-  player.x =
-    safeNumber(
-      message.x,
-      0
-    );
-
-  player.y =
-    safeNumber(
-      message.y,
-      0
-    );
-
-  player.z =
-    safeNumber(
-      message.z,
-      0
-    );
-
-  player.rotation =
-    safeNumber(
-      message.rotation,
-      0
-    );
-
-
-  player.joined =
-    true;
-
-
-  // ----------------------------------------------------
-  // Send existing world to this player
-  // ----------------------------------------------------
-
-  send(player.ws, {
-
-    type: "world:init",
-
-    playerId:
-      player.id,
-
-    players:
-      [...players.values()]
-        .filter(
-          p =>
-            p.joined &&
-            p !== player
-        )
-        .map(publicPlayer)
-
-  });
-
-
-  // ----------------------------------------------------
-  // Notify other players
-  // ----------------------------------------------------
-
-  broadcast({
-
-    type: "player:join",
-
-    player:
-      publicPlayer(player)
-
-  }, player);
-
-
-  console.log(
-    `${player.username} joined`
-  );
-
-}
-
-
-// ======================================================
-// MOVEMENT
-// ======================================================
-
-function handleMovement(
-  player,
-  message
-) {
-
-  if (
-    !player.authenticated ||
-    !player.joined
-  ) {
-
-    return;
-
-  }
-
-
-  const now =
-    Date.now();
-
-
-  // Basic packet-rate protection
-
-  if (
-    now - player.lastMove <
-    MOVEMENT_INTERVAL
-  ) {
-
-    return;
-
-  }
-
-
-  player.lastMove =
-    now;
-
-
-  const x =
-    Number(message.x);
-
-  const y =
-    Number(message.y);
-
-  const z =
-    Number(message.z);
-
-  const rotation =
-    Number(message.rotation);
-
-
-  if (
-    !Number.isFinite(x) ||
-    !Number.isFinite(y) ||
-    !Number.isFinite(z)
-  ) {
-
-    return;
-
-  }
-
-
-  if (
-    Math.abs(x) >
-      MAX_COORDINATE ||
-
-    Math.abs(y) >
-      MAX_COORDINATE ||
-
-    Math.abs(z) >
-      MAX_COORDINATE
-  ) {
-
-    return;
-
-  }
-
-
-  player.x = x;
-
-  player.y = y;
-
-  player.z = z;
-
-
-  if (
-    Number.isFinite(rotation)
-  ) {
-
-    player.rotation =
-      rotation;
-
-  }
-
-
-  broadcast({
-
-    type: "player:move",
-
-    player:
-      publicPlayer(player)
-
-  }, player);
-
-}
-
-
-// ======================================================
-// CHAT
-// ======================================================
-
-function handleChat(
-  player,
-  message
-) {
-
-  if (
-    !player.authenticated ||
-    !player.joined
-  ) {
-
-    return;
-
-  }
-
-
-  const text =
-    String(
-      message.text || ""
-    )
-    .trim()
-    .slice(
-      0,
-      MAX_CHAT_LENGTH
-    );
-
-
-  if (!text) {
-    return;
-  }
-
-
-  broadcast({
-
-    type: "chat",
-
-    playerId:
-      player.id,
-
-    username:
-      player.username,
-
-    text
-
-  });
-
-}
-
-
-// ======================================================
-// DISCONNECT
-// ======================================================
-
-function handleDisconnect(
-  player
-) {
-
-  if (
-    player.joined
-  ) {
-
-    broadcast({
-
-      type: "player:leave",
-
-      id:
-        player.id,
-
-      uid:
-        player.uid
-
-    }, player);
-
-  }
-
-
-  players.delete(
-    player.id
-  );
-
-
-  console.log(
-    "Disconnected:",
-    player.username,
-    player.uid
-  );
-
-}
-
-
-// ======================================================
-// NUMBER SAFETY
-// ======================================================
-
-function safeNumber(
-  value,
-  fallback
-) {
-
-  const number =
-    Number(value);
-
-
-  if (
-    Number.isFinite(number)
-  ) {
-
-    return number;
-
-  }
-
-
-  return fallback;
-
-}
-
-
-// ======================================================
-// SERVER START
-// ======================================================
-
-httpServer.listen(
-  PORT,
-  "0.0.0.0",
-  () => {
-
-    console.log(
-      `MG World server running on port ${PORT}`
-    );
-
-  }
-);
+loadWorld().then(()=>{
+  const port=process.env.PORT||3000;
+  server.listen(port,()=>console.log(`MG World server listening on ${port}`));
+}).catch(e=>{console.error(e);process.exit(1)});
